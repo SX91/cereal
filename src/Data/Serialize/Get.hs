@@ -2,6 +2,7 @@
 {-# LANGUAGE MagicHash  #-}
 {-# LANGUAGE Rank2Types #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -38,10 +39,14 @@ module Data.Serialize.Get (
 
     -- * Parsing
     , ensure
+    , ensure_
     , isolate
+    , isolate'
     , label
+    , (<?>)
     , skip
     , uncheckedSkip
+    , matchParsed
     , lookAhead
     , lookAheadM
     , lookAheadE
@@ -49,7 +54,9 @@ module Data.Serialize.Get (
 
     -- * Utility
     , getBytes
+    , getBuffer
     , remaining
+    , bytesRead
     , isEmpty
 
     -- * Parsing particular types
@@ -100,12 +107,13 @@ module Data.Serialize.Get (
 
 import qualified Control.Applicative as A
 import qualified Control.Monad as M
-import Control.Monad (unless)
 import qualified Control.Monad.Fail as Fail
+import Data.Semigroup (Semigroup(..))
 import Data.Array.IArray (IArray,listArray)
 import Data.Ix (Ix)
 import Data.List (intercalate)
-import Data.Maybe (isNothing,fromMaybe)
+import Data.Maybe (isNothing, fromMaybe)
+import Data.Either (isLeft)
 import Foreign
 import System.IO.Unsafe (unsafeDupablePerformIO)
 
@@ -113,6 +121,7 @@ import qualified Data.ByteString          as B
 import qualified Data.ByteString.Internal as B
 import qualified Data.ByteString.Unsafe   as B
 import qualified Data.ByteString.Lazy     as L
+import qualified Data.ByteString.Lazy.Internal as L
 import qualified Data.ByteString.Short    as BS
 import qualified Data.IntMap              as IntMap
 import qualified Data.IntSet              as IntSet
@@ -120,6 +129,9 @@ import qualified Data.Map                 as Map
 import qualified Data.Sequence            as Seq
 import qualified Data.Set                 as Set
 import qualified Data.Tree                as T
+
+import qualified Data.Serialize.Buffer as Buf
+import Data.Serialize.Buffer (Buffer)
 
 #if defined(__GLASGOW_HASKELL__) && !defined(__HADDOCK__)
 import GHC.Base
@@ -149,34 +161,18 @@ instance Functor Result where
     fmap f (Partial k)     = Partial (fmap f . k)
     fmap f (Done r bs)     = Done (f r) bs
 
+newtype Pos = Pos {fromPos :: Int}
+  deriving (Eq, Ord, Num, Enum, Bounded, Show)
+
 -- | The Get monad is an Exception and State monad.
 newtype Get a = Get
-  { unGet :: forall r. Input -> Buffer -> More
+  { unGet :: forall r. Buffer -> Pos -> More
                     -> Failure r -> Success a r
-                    -> Result r }
+                    -> Result r
+  }
 
-type Input  = B.ByteString
-type Buffer = Maybe B.ByteString
-
-emptyBuffer :: Buffer
-emptyBuffer  = Just B.empty
-
-extendBuffer :: Buffer -> B.ByteString -> Buffer
-extendBuffer buf chunk =
-  do bs <- buf
-     return $! bs `B.append` chunk
-{-# INLINE extendBuffer #-}
-
-append :: Buffer -> Buffer -> Buffer
-append l r = B.append `fmap` l A.<*> r
-{-# INLINE append #-}
-
-bufferBytes :: Buffer -> B.ByteString
-bufferBytes  = fromMaybe B.empty
-{-# INLINE bufferBytes #-}
-
-type Failure   r = Input -> Buffer -> More -> [String] -> String -> Result r
-type Success a r = Input -> Buffer -> More -> a                  -> Result r
+type Failure   r = Buffer -> Pos -> More -> [String] -> String -> Result r
+type Success a r = Buffer -> Pos -> More -> a                  -> Result r
 
 -- | Have we read all available input?
 data More
@@ -188,96 +184,130 @@ moreLength :: More -> Int
 moreLength m = case m of
   Complete      -> 0
   Incomplete mb -> fromMaybe 0 mb
+{-# INLINE moreLength #-}
+
 
 instance Functor Get where
-    fmap p m =        Get $ \ s0 b0 m0 kf ks ->
-      unGet m s0 b0 m0 kf $ \ s1 b1 m1 a     -> ks s1 b1 m1 (p a)
+    fmap p m = Get $ \ b0 p0 m0 kf ks ->
+      let ks' b1 p1 m1 a = ks b1 p1 m1 (p a)
+      in unGet m b0 p0 m0 kf ks'
+    {-# INLINE fmap #-}
+      -- unGet m s0 b0 m0 kf $ \ b1 p1 m1 a     -> ks b1 p1 m1 (p a)
+
+-- apP :: Get (a -> b) -> Get a -> Get b
+-- apP d e = do
+--   b <- d
+--   a <- e
+--   return (b a)
+-- {-# INLINE apP #-}
+
+apP :: Get (a -> b) -> Get a -> Get b
+apP f x =             Get $ \ b0 p0 m0 kf ks ->
+      unGet f b0 p0 m0 kf $ \ b1 p1 m1 g     ->
+      unGet x b1 p1 m1 kf $ \ b2 p2 m2 y     -> ks b2 p2 m2 (g y)
+{-# INLINE apP #-}
+
+plus :: Get a -> Get a -> Get a
+plus f g = Get $ \b0 !p0 m0 kf ks ->
+  let kf' b1 _ m1 _ _ = unGet g b1 p0 m1 kf ks
+  in unGet f b0 p0 m0 kf' ks
+{-# INLINE plus #-}
+
+instance M.MonadPlus Get where
+    mzero = failDesc "mzero"
+
+    mplus = plus
+    {-# INLINE mplus #-}
 
 instance A.Applicative Get where
-    pure a = Get $ \ s0 b0 m0 _ ks -> ks s0 b0 m0 a
+    pure a = Get $ \ b0 p0 m0 _ ks -> ks b0 p0 m0 a
     {-# INLINE pure #-}
 
-    f <*> x =         Get $ \ s0 b0 m0 kf ks ->
-      unGet f s0 b0 m0 kf $ \ s1 b1 m1 g     ->
-      unGet x s1 b1 m1 kf $ \ s2 b2 m2 y     -> ks s2 b2 m2 (g y)
+    (<*>) = apP
+      -- Get $ \ s0 b0 m0 kf ks ->
+      -- unGet f s0 b0 m0 kf $ \ s1 b1 m1 g     ->
+      -- unGet x s1 b1 m1 kf $ \ s2 b2 m2 y     -> ks s2 b2 m2 (g y)
     {-# INLINE (<*>) #-}
 
-    m *> k =          Get $ \ s0 b0 m0 kf ks ->
-      unGet m s0 b0 m0 kf $ \ s1 b1 m1 _     -> unGet k s1 b1 m1 kf ks
+    m *> k = m >>= \_ -> k
+      -- Get $ \ s0 b0 m0 kf ks ->
+      -- unGet m s0 b0 m0 kf $ \ s1 b1 m1 _     -> unGet k s1 b1 m1 kf ks
     {-# INLINE (*>) #-}
+
+    x <* y = x >>= \a -> y >> pure a
+    {-# INLINE (<*) #-}
+
+instance Semigroup (Get a) where
+    (<>) = plus
+    {-# INLINE (<>) #-}
+
+instance Monoid (Get a) where
+    mempty  = fail "mempty"
+    {-# INLINE mempty #-}
+    mappend = (<>)
+    {-# INLINE mappend #-}
 
 instance A.Alternative Get where
     empty = failDesc "empty"
     {-# INLINE empty #-}
 
-    (<|>) = M.mplus
+    (<|>) = plus
     {-# INLINE (<|>) #-}
+
+instance Fail.MonadFail Get where
+    fail err = Get $ \b0 p0 m0 kf _ -> kf b0 p0 m0 [] msg
+      where msg = "Failed reading: " ++ err
+    {-# INLINE fail #-}
 
 -- Definition directly from Control.Monad.State.Strict
 instance Monad Get where
+    fail = Fail.fail
+    {-# INLINE fail #-}
+
     return = A.pure
     {-# INLINE return #-}
 
-    m >>= g  =        Get $ \ s0 b0 m0 kf ks ->
-      unGet m s0 b0 m0 kf $ \ s1 b1 m1 a     -> unGet (g a) s1 b1 m1 kf ks
+    m >>= g = Get $ \ b0 !p0 m0 kf ks ->
+      let ks' b1 !p1 m1 a = unGet (g a) b1 p1 m1 kf ks
+      in unGet m b0 p0 m0 kf ks'
+        -- unGet m b0 p0 m0 kf $ \ s1 b1 m1 a     -> unGet (g a) s1 b1 m1 kf ks
     {-# INLINE (>>=) #-}
 
     (>>) = (A.*>)
     {-# INLINE (>>) #-}
 
-    fail     = Fail.fail
-    {-# INLINE fail #-}
-
-instance Fail.MonadFail Get where
-    fail     = failDesc
-    {-# INLINE fail #-}
-
-instance M.MonadPlus Get where
-    mzero     = failDesc "mzero"
-    {-# INLINE mzero #-}
-
-    mplus a b =
-      Get $ \s0 b0 m0 kf ks ->
-        let ks' s1 b1        = ks s1 (b0 `append` b1)
-            kf' _  b1 m1     = kf (s0 `B.append` bufferBytes b1)
-                                  (b0 `append` b1) m1
-            try _  b1 m1 _ _ = unGet b (s0 `B.append` bufferBytes b1)
-                                       b1 m1 kf' ks'
-         in unGet a s0 emptyBuffer m0 try ks'
-    {-# INLINE mplus #-}
-
-
 ------------------------------------------------------------------------
+
+unsafeSubstring :: Pos -> Pos -> Buffer -> B.ByteString
+unsafeSubstring (Pos pos) (Pos n) = Buf.unsafeSubstring pos n
+{-# INLINE unsafeSubstring #-}
 
 formatTrace :: [String] -> String
 formatTrace [] = "Empty call stack"
 formatTrace ls = "From:\t" ++ intercalate "\n\t" ls ++ "\n"
 
-get :: Get B.ByteString
-get  = Get (\s0 b0 m0 _ k -> k s0 b0 m0 s0)
-{-# INLINE get #-}
-
-put :: B.ByteString -> Get ()
-put s = Get (\_ b0 m _ k -> k s b0 m ())
-{-# INLINE put #-}
-
 label :: String -> Get a -> Get a
-label l m =
-  Get $ \ s0 b0 m0 kf ks ->
-    let kf' s1 b1 m1 ls = kf s1 b1 m1 (l:ls)
-     in unGet m s0 b0 m0 kf' ks
+label l m = Get $ \ b0 p0 m0 kf ks ->
+  let kf' b1 _ m1 ls = kf b1 p0 m1 (l:ls)
+  in unGet m b0 p0 m0 kf' ks
+{-# INLINE label #-}
+
+(<?>) :: Get a -> String -> Get a
+g <?> msg0 = label msg0 g
+{-# INLINE (<?>) #-}
+infix 0 <?>
 
 finalK :: Success a a
-finalK s _ _ a = Done a s
+finalK buf (Pos pos) _ a = Done a (Buf.unsafeDrop pos buf)
 
 failK :: Failure a
-failK s b _ ls msg =
-  Fail (unlines [msg, formatTrace ls]) (s `B.append` bufferBytes b)
+failK b (Pos pos) _ ls msg =
+  Fail (unlines [msg, formatTrace ls]) (Buf.unsafeDrop pos b)
 
 -- | Run the Get monad applies a 'get'-based parser on the input ByteString
 runGet :: Get a -> B.ByteString -> Either String a
 runGet m str =
-  case unGet m str Nothing Complete failK finalK of
+  case unGet m (Buf.buffer str) (Pos 0) Complete failK finalK of
     Fail i _  -> Left i
     Done a _  -> Right a
     Partial{} -> Left "Failed reading: Internal error: unexpected Partial."
@@ -288,12 +318,12 @@ runGet m str =
 -- input is left.  For example, with a lazy ByteString, the optional length
 -- represents the sum of the lengths of all remaining chunks.
 runGetChunk :: Get a -> Maybe Int -> B.ByteString -> Result a
-runGetChunk m mbLen str = unGet m str Nothing (Incomplete mbLen) failK finalK
+runGetChunk m mbLen str = unGet m (Buf.buffer str) (Pos 0) (Incomplete mbLen) failK finalK
 {-# INLINE runGetChunk #-}
 
 -- | Run the Get monad applies a 'get'-based parser on the input ByteString
 runGetPartial :: Get a -> B.ByteString -> Result a
-runGetPartial m = runGetChunk m Nothing
+runGetPartial g = runGetChunk g Nothing
 {-# INLINE runGetPartial #-}
 
 -- | Run the Get monad applies a 'get'-based parser on the input
@@ -312,163 +342,226 @@ runGetState m str off = case runGetState' m str off of
 runGetState' :: Get a -> B.ByteString -> Int
              -> (Either String a, B.ByteString)
 runGetState' m str off =
-  case unGet m (B.drop off str) Nothing Complete failK finalK of
+  case unGet m (Buf.buffer (B.drop off str)) (Pos 0) Complete failK finalK of
     Fail i bs -> (Left i,bs)
     Done a bs -> (Right a, bs)
     Partial{} -> (Left "Failed reading: Internal error: unexpected Partial.",B.empty)
 {-# INLINE runGetState' #-}
 
 
-
 -- Lazy Get --------------------------------------------------------------------
 
-runGetLazy' :: Get a -> L.ByteString -> (Either String a,L.ByteString)
-runGetLazy' m lstr =
-  case L.toChunks lstr of
-    [c]  -> wrapStrict (runGetState' m c       0)
-    []   -> wrapStrict (runGetState' m B.empty 0)
-    c:cs -> loop (runGetChunk m (Just (len - B.length c)) c) cs
+runGetLazy'' :: Get a -> L.ByteString -> Result a
+runGetLazy'' m str =
+  case str of
+    L.Chunk x xs -> go (runGetChunk m (Just (fromIntegral $ L.length str)) x) xs
+    e            -> go (runGetPartial m B.empty) e
   where
-  len = fromIntegral (L.length lstr)
-
-  wrapStrict (e,s) = (e,L.fromChunks [s])
-
-  loop result chunks = case result of
-
-    Fail str rest -> (Left str, L.fromChunks (rest : chunks))
-
-    Partial k     -> case chunks of
-                       c:cs -> loop (k c)       cs
-                       []   -> loop (k B.empty) []
-
-    Done r rest   -> (Right r, L.fromChunks (rest : chunks))
-{-# INLINE runGetLazy' #-}
+    go (Fail msg x) ys            = Fail msg (L.toStrict $ L.chunk x ys)
+    go (Done r x) ys              = Done r (L.toStrict $ L.chunk x ys)
+    go (Partial k) (L.Chunk y ys) = go (k y) ys
+    go (Partial k) e              = go (k B.empty) e
+{-# INLINE runGetLazy'' #-}
 
 -- | Run the Get monad over a Lazy ByteString.  Note that this will not run the
 -- Get parser lazily, but will operate on lazy ByteStrings.
 runGetLazy :: Get a -> L.ByteString -> Either String a
-runGetLazy m lstr = fst (runGetLazy' m lstr)
+runGetLazy m lstr = case runGetLazy'' m lstr of
+  Done r _   -> Right r
+  Fail msg _ -> Left msg
+  _          -> undefined
 {-# INLINE runGetLazy #-}
 
 -- | Run the Get monad over a Lazy ByteString.  Note that this does not run the
 -- Get parser lazily, but will operate on lazy ByteStrings.
 runGetLazyState :: Get a -> L.ByteString -> Either String (a,L.ByteString)
-runGetLazyState m lstr = case runGetLazy' m lstr of
-  (Right a,rest) -> Right (a,rest)
-  (Left err,_)   -> Left err
+runGetLazyState m lstr = case runGetLazy'' m lstr of
+  Done r x   -> Right (r, L.fromChunks [x])
+  Fail msg _ -> Left msg
+  _          -> undefined
 {-# INLINE runGetLazyState #-}
 
 ------------------------------------------------------------------------
 
+lengthAtLeast :: Pos -> Int -> Buffer -> Bool
+lengthAtLeast (Pos pos) n bs = Buf.length bs >= pos + n
+{-# INLINE lengthAtLeast #-}
+
+advance :: Int -> Get ()
+advance !n = Get $ \buf pos more _ ks ->
+  ks buf (pos + Pos n) more ()
+{-# INLINE advance #-}
+
+-- | Ask for input.  If we receive any, pass the augmented input to a
+-- success continuation, otherwise to a failure continuation.
+prompt :: Buffer -> Pos -> More
+       -> (Buffer -> Pos -> More -> Result r)
+       -> (Buffer -> Pos -> More -> Result r)
+       -> Result r
+prompt buf pos more lose ks = Partial $ \s ->
+  if B.length s == 0
+      then lose buf pos Complete
+      else
+        let mbMore (Incomplete x) = x
+            mbMore _              = Nothing
+        in ks (buf `Buf.pappend` s) pos (Incomplete $ mbMore more)
+{-# INLINE prompt #-}
+
+-- | Immediately demand more input via a 'Partial' continuation
+-- result.
+demandInput :: Get ()
+demandInput = Get $ \b0 p0 !m0 kf ks ->
+  case m0 of
+    Complete -> kf b0 p0 m0 [] "not enough input"
+    _ -> let kf' _ p1 m1 = kf b0 p1 m1 [] "not enough input"
+             ks' b1 p1 m1 = ks b1 p1 m1 ()
+         in prompt b0 p0 m0 kf' ks'
+{-# INLINE demandInput #-}
+
+{-# INLINE ensureSuspended #-}
+ensureSuspended :: Int -> Buffer -> Pos -> More
+                -> Failure r
+                -> Success B.ByteString r
+                -> Result r
+ensureSuspended n b0 p0 = unGet (demandInput >> go) b0 p0
+  where go = Get $ \b1 p1 m1 kf' ks' ->
+          if lengthAtLeast p1 n b1
+              then ks' b1 p1 m1 (unsafeSubstring p0 (Pos n) b1)
+              else unGet (demandInput >> go) b1 p1 m1 kf' ks'
+
+{-# INLINE ensureSuspended_ #-}
+ensureSuspended_ :: Int -> Buffer -> Pos -> More
+                 -> Failure r
+                 -> Success () r
+                 -> Result r
+ensureSuspended_ n = unGet (demandInput >> go)
+  where go = Get $ \b1 p1 m1 kf' ks' ->
+          if lengthAtLeast p1 n b1
+              then ks' b1 p1 m1 ()
+              else unGet (demandInput >> go) b1 p1 m1 kf' ks'
+
+{-# INLINE ensureSuspendedBuf #-}
+ensureSuspendedBuf :: Int -> Buffer -> Pos -> More
+                   -> Failure r
+                   -> Success Buffer r
+                   -> Result r
+ensureSuspendedBuf n b0 p0 = unGet (demandInput >> go) b0 p0
+  where go = Get $ \b1 p1 m1 kf' ks' ->
+          if lengthAtLeast p1 n b1
+              then ks' b1 p1 m1 (Buf.unsafeShrink (fromPos p0) n b1)
+              else unGet (demandInput >> go) b1 p1 m1 kf' ks'
+
 -- | If at least @n@ bytes of input are available, return the current
 --   input, otherwise fail.
-{-# INLINE ensure #-}
 ensure :: Int -> Get B.ByteString
-ensure n0 = n0 `seq` Get $ \ s0 b0 m0 kf ks -> let
-    n' = n0 - B.length s0
-    in if n' <= 0
-        then ks s0 b0 m0 s0
-        else getMore n' s0 [] b0 m0 kf ks
-    where
-        -- The "accumulate and concat" pattern here is important not to incur
-        -- in quadratic behavior, see <https://github.com/GaloisInc/cereal/issues/48>
+ensure n0 = n0 `seq` Get $ \ b0 p0 m0 kf ks ->
+  if lengthAtLeast p0 n0 b0
+      then ks b0 p0 m0 (unsafeSubstring p0 (Pos n0) b0)
+      else ensureSuspended n0 b0 p0 m0 kf ks
+{-# INLINE ensure #-}
 
-        finalInput s0 ss = B.concat (reverse (s0 : ss))
-        finalBuffer b0 s0 ss = extendBuffer b0 (B.concat (reverse (init (s0 : ss))))
+-- | If at least @n@ bytes of input are available, succeed,
+--   otherwise fail.
+ensure_ :: Int -> Get ()
+ensure_ n0 = n0 `seq` Get $ \ b0 p0 m0 kf ks ->
+  if lengthAtLeast p0 n0 b0
+      then ks b0 p0 m0 ()
+      else ensureSuspended_ n0 b0 p0 m0 kf ks
+{-# INLINE ensure_ #-}
 
-        getMore !n s0 ss b0 m0 kf ks = let
-            tooFewBytes = let
-                !s = finalInput s0 ss
-                !b = finalBuffer b0 s0 ss
-                in kf s b m0 ["demandInput"] "too few bytes"
-            in case m0 of
-                Complete -> tooFewBytes
-                Incomplete mb -> Partial $ \s ->
-                    if B.null s
-                        then tooFewBytes
-                        else let
-                            !mb' = case mb of
-                                Just l -> Just $! l - B.length s
-                                Nothing -> Nothing
-                            in checkIfEnough n s (s0 : ss) b0 (Incomplete mb') kf ks
+-- | If at least @n@ bytes of input are available, succeed,
+--   otherwise fail.
+ensureBuf :: Int -> Get Buf.Buffer
+ensureBuf n0 = n0 `seq` Get $ \ b0 p0 m0 kf ks ->
+  if lengthAtLeast p0 n0 b0
+      then ks b0 p0 m0 (Buf.unsafeShrink (fromPos p0) n0 b0)
+      else ensureSuspendedBuf n0 b0 p0 m0 kf ks
+{-# INLINE ensureBuf #-}
 
-        checkIfEnough !n s0 ss b0 m0 kf ks = let
-            n' = n - B.length s0
-            in if n' <= 0
-                then let
-                    !s = finalInput s0 ss
-                    !b = finalBuffer b0 s0 ss
-                    in ks s b m0 s
-                else getMore n' s0 ss b0 m0 kf ks
+-- | Return bytes read till now.
+bytesRead :: Get Int
+bytesRead = Get $ \b0 !p0 m0 _ ks -> ks b0 p0 m0 (fromPos p0)
+{-# INLINE bytesRead #-}
 
 -- | Isolate an action to operating within a fixed block of bytes.  The action
 --   is required to consume all the bytes that it is isolated to.
 isolate :: Int -> Get a -> Get a
-isolate n m = do
-  M.when (n < 0) (fail "Attempted to isolate a negative number of bytes")
-  s <- ensure n
-  let (s',rest) = B.splitAt n s
-  put s'
-  a    <- m
-  used <- get
-  unless (B.null used) (fail "not all bytes parsed in isolate")
-  put rest
-  return a
+isolate n m = Get $ \b0 !p0 m0 kf ks ->
+  let ks' b1 !p1 m1 a =
+        if p1 - p0 == Pos n
+          then ks b1 p1 m1 a
+          else kf b1 p0 m1 [] "isolate: not all bytes parsed"
+  in unGet (isolate' n m) b0 p0 m0 kf ks'
+{-# INLINE isolate #-}
+
+  -- | Isolate an action to operating within a fixed block of bytes.  Unlike
+  --   isolate, isolate' doesn't require action to consume all the bytes.
+isolate' :: Int -> Get a -> Get a
+isolate' n g
+    | n >= 0 = ensure_ n >> go
+    | otherwise = fail "isolate': negative n"
+  where
+    go = Get $ \b0 p0 m0 kf ks ->
+      let ks' _ = ks b0
+          !buf' = Buf.unsafeShrink 0 (fromPos p0 + n) b0
+      in unGet g buf' p0 m0 kf ks'
+{-# INLINE isolate' #-}
+
+matchParsed :: Get a -> Get (a, Int)
+matchParsed g = Get $ \b0 p0 m0 kf ks ->
+  let ks' b1 p1 m1 a = ks b1 p1 m1 (a, fromPos (p1 - p0))
+  in unGet g b0 p0 m0 kf ks'
+{-# INLINE matchParsed #-}
 
 failDesc :: String -> Get a
-failDesc err = do
-    let msg = "Failed reading: " ++ err
-    Get (\s0 b0 m0 kf _ -> kf s0 b0 m0 [] msg)
+failDesc err = Get $ \b0 p0 m0 kf _ ->
+    let !msg = "Failed reading: " ++ err
+    in kf b0 p0 m0 [] msg
 
 -- | Skip ahead @n@ bytes. Fails if fewer than @n@ bytes are available.
 skip :: Int -> Get ()
-skip n = do
-  s <- ensure n
-  put (B.drop n s)
+skip n = ensure_ n >> advance n
+{-# INLINE skip #-}
 
 -- | Skip ahead up to @n@ bytes in the current chunk. No error if there aren't
 -- enough bytes, or if less than @n@ bytes are skipped.
 uncheckedSkip :: Int -> Get ()
-uncheckedSkip n = do
-    s <- get
-    put (B.drop n s)
+uncheckedSkip !n = Get $ \b0 p0 m0 _ ks ->
+  case Buf.length b0 of
+    len | len >= n + fromPos p0 -> ks b0 (p0 + Pos n) m0 ()
+        | otherwise -> ks b0 (Pos (Buf.length b0)) m0 ()
+{-# INLINE uncheckedSkip #-}
 
 -- | Run @ga@, but return without consuming its input.
 -- Fails if @ga@ fails.
 lookAhead :: Get a -> Get a
-lookAhead ga = Get $ \ s0 b0 m0 kf ks ->
+lookAhead ga = Get $ \ b0 p0 m0 kf ks ->
   -- the new continuation extends the old input with the new buffered bytes, and
   -- appends the new buffer to the old one, if there was one.
-  let ks' _ b1 = ks (s0 `B.append` bufferBytes b1) (b0 `append` b1)
-      kf' _ b1 = kf s0 (b0 `append` b1)
-   in unGet ga s0 emptyBuffer m0 kf' ks'
+  let ks' b1 _ _ = ks b1 p0 m0
+      kf' b1 _ _ = kf b1 p0 m0
+   in unGet ga b0 p0 m0 kf' ks'
 
 -- | Like 'lookAhead', but consume the input if @gma@ returns 'Just _'.
 -- Fails if @gma@ fails.
 lookAheadM :: Get (Maybe a) -> Get (Maybe a)
-lookAheadM gma = do
-    s <- get
-    ma <- gma
-    M.when (isNothing ma) (put s)
-    return ma
+lookAheadM gma = Get $ \ b0 p0 m0 kf ks ->
+  let ks' b1 p1 _ a = ks b1 (if isNothing a then p0 else p1) m0 a
+      kf' b1 _ _ = kf b1 p0 m0
+   in unGet gma b0 p0 m0 kf' ks'
 
 -- | Like 'lookAhead', but consume the input if @gea@ returns 'Right _'.
 -- Fails if @gea@ fails.
 lookAheadE :: Get (Either a b) -> Get (Either a b)
-lookAheadE gea = do
-    s <- get
-    ea <- gea
-    case ea of
-        Left _ -> put s
-        _      -> return ()
-    return ea
+lookAheadE gea = Get $ \ b0 p0 m0 kf ks ->
+  let ks' b1 p1 _ a = ks b1 (if isLeft a then p0 else p1) m0 a
+      kf' b1 _ _ = kf b1 p0 m0
+   in unGet gea b0 p0 m0 kf' ks'
 
 -- | Get the next up to @n@ bytes as a ByteString until end of this chunk,
 -- without consuming them.
 uncheckedLookAhead :: Int -> Get B.ByteString
-uncheckedLookAhead n = do
-    s <- get
-    return (B.take n s)
+uncheckedLookAhead !n = Get $ \b0 p0 m0 _ ks -> ks b0 p0 m0 (Buf.substring (fromPos p0) n b0)
 
 ------------------------------------------------------------------------
 -- Utility
@@ -479,14 +572,16 @@ uncheckedLookAhead n = do
 -- WARNING: when run with @runGetPartial@, remaining will only return the number
 -- of bytes that are remaining in the current input.
 remaining :: Get Int
-remaining = Get (\ s0 b0 m0 _ ks -> ks s0 b0 m0 (B.length s0 + moreLength m0))
+remaining = Get $ \ b0 p0 !m0 _ ks -> ks b0 p0 m0 (max (Buf.length b0) (moreLength m0) - fromPos p0)
+{-# INLINE remaining #-}
 
 -- | Test whether all input has been consumed.
 --
 -- WARNING: when run with @runGetPartial@, isEmpty will only tell you if you're
 -- at the end of the current chunk.
 isEmpty :: Get Bool
-isEmpty = Get (\ s0 b0 m0 _ ks -> ks s0 b0 m0 (B.null s0 && moreLength m0 == 0))
+isEmpty = Get $ \ b0 p0 !m0 _ ks -> ks b0 p0 m0 (fromPos p0 == max (Buf.length b0) (moreLength m0))
+{-# INLINE isEmpty #-}
 
 ------------------------------------------------------------------------
 -- Utility with ByteStrings
@@ -512,19 +607,24 @@ getShortByteString n = do
 ------------------------------------------------------------------------
 -- Helpers
 
--- | Pull @n@ bytes from the input, as a strict ByteString.
+-- | Pull @n@ bytes from the input, as a strict ByteString, without copying.
 getBytes :: Int -> Get B.ByteString
 getBytes n | n < 0 = fail "getBytes: negative length requested"
-getBytes n = do
-    s <- ensure n
-    let consume = B.unsafeTake n s
-        rest    = B.unsafeDrop n s
-        -- (consume,rest) = B.splitAt n s
-    put rest
-    return consume
+getBytes n = ensure n <* advance n
 {-# INLINE getBytes #-}
 
+-- | Pull @n@ bytes from the input, as a Buffer.
+getBuffer :: Int -> Get Buf.Buffer
+getBuffer n | n < 0 = fail "getBuffer: negative length requested"
+getBuffer n = getBuffer' n
+{-# INLINE getBuffer #-}
 
+-- | Ensure @n@ bytes from the input, return an underlying Buffer.
+getBuffer' :: Int -> Get Buf.Buffer
+getBuffer' !n0 = Get $ \ b0 p0 m0 kf ks ->
+  let ks' b1 p1 = ks b1 (p1 + Pos n0)
+  in unGet (ensureBuf n0) b0 p0 m0 kf ks'
+{-# INLINE getBuffer' #-}
 
 ------------------------------------------------------------------------
 -- Primtives
@@ -534,7 +634,7 @@ getBytes n = do
 
 getPtr :: Storable a => Int -> Get a
 getPtr n = do
-    (fp,o,_) <- B.toForeignPtr `fmap` getBytes n
+    (fp,o,_) <- Buf.toForeignPtr `fmap` getBuffer n
     let k p = peek (castPtr (p `plusPtr` o))
     return (unsafeDupablePerformIO (withForeignPtr fp k))
 {-# INLINE getPtr #-}
@@ -544,66 +644,66 @@ getPtr n = do
 -- | Read a Int8 from the monad state
 getInt8 :: Get Int8
 getInt8 = do
-    s <- getBytes 1
-    return $! fromIntegral (B.unsafeHead s)
+    s <- getBuffer' 1
+    return $! fromIntegral (Buf.unsafeHead s)
 
 -- | Read a Int16 in big endian format
 getInt16be :: Get Int16
 getInt16be = do
-    s <- getBytes 2
-    return $! (fromIntegral (s `B.unsafeIndex` 0) `shiftL` 8) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) )
+    s <- getBuffer' 2
+    return $! (fromIntegral (s `Buf.unsafeIndex` 0) `shiftL` 8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) )
 
 -- | Read a Int16 in little endian format
 getInt16le :: Get Int16
 getInt16le = do
-    s <- getBytes 2
-    return $! (fromIntegral (s `B.unsafeIndex` 1) `shiftL` 8) .|.
-              (fromIntegral (s `B.unsafeIndex` 0) )
+    s <- getBuffer' 2
+    return $! (fromIntegral (s `Buf.unsafeIndex` 1) `shiftL` 8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 0) )
 
 -- | Read a Int32 in big endian format
 getInt32be :: Get Int32
 getInt32be = do
-    s <- getBytes 4
-    return $! (fromIntegral (s `B.unsafeIndex` 0) `shiftL` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftL` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftL`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 3) )
+    s <- getBuffer' 4
+    return $! (fromIntegral (s `Buf.unsafeIndex` 0) `shiftL` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftL` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftL`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 3) )
 
 -- | Read a Int32 in little endian format
 getInt32le :: Get Int32
 getInt32le = do
-    s <- getBytes 4
-    return $! (fromIntegral (s `B.unsafeIndex` 3) `shiftL` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftL` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftL`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 0) )
+    s <- getBuffer' 4
+    return $! (fromIntegral (s `Buf.unsafeIndex` 3) `shiftL` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftL` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftL`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 0) )
 
 -- | Read a Int64 in big endian format
 getInt64be :: Get Int64
 getInt64be = do
-    s <- getBytes 8
-    return $! (fromIntegral (s `B.unsafeIndex` 0) `shiftL` 56) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftL` 48) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftL` 40) .|.
-              (fromIntegral (s `B.unsafeIndex` 3) `shiftL` 32) .|.
-              (fromIntegral (s `B.unsafeIndex` 4) `shiftL` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 5) `shiftL` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 6) `shiftL`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 7) )
+    s <- getBuffer' 8
+    return $! (fromIntegral (s `Buf.unsafeIndex` 0) `shiftL` 56) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftL` 48) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftL` 40) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 3) `shiftL` 32) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 4) `shiftL` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 5) `shiftL` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 6) `shiftL`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 7) )
 
 -- | Read a Int64 in little endian format
 getInt64le :: Get Int64
 getInt64le = do
-    s <- getBytes 8
-    return $! (fromIntegral (s `B.unsafeIndex` 7) `shiftL` 56) .|.
-              (fromIntegral (s `B.unsafeIndex` 6) `shiftL` 48) .|.
-              (fromIntegral (s `B.unsafeIndex` 5) `shiftL` 40) .|.
-              (fromIntegral (s `B.unsafeIndex` 4) `shiftL` 32) .|.
-              (fromIntegral (s `B.unsafeIndex` 3) `shiftL` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftL` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftL`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 0) )
+    s <- getBuffer' 8
+    return $! (fromIntegral (s `Buf.unsafeIndex` 7) `shiftL` 56) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 6) `shiftL` 48) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 5) `shiftL` 40) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 4) `shiftL` 32) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 3) `shiftL` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftL` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftL`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 0) )
 
 {-# INLINE getInt8    #-}
 {-# INLINE getInt16be #-}
@@ -618,66 +718,66 @@ getInt64le = do
 -- | Read a Word8 from the monad state
 getWord8 :: Get Word8
 getWord8 = do
-    s <- getBytes 1
-    return (B.unsafeHead s)
+    s <- getBuffer' 1
+    return $! Buf.unsafeHead s
 
 -- | Read a Word16 in big endian format
 getWord16be :: Get Word16
 getWord16be = do
-    s <- getBytes 2
-    return $! (fromIntegral (s `B.unsafeIndex` 0) `shiftl_w16` 8) .|.
-              (fromIntegral (s `B.unsafeIndex` 1))
+    s <- getBuffer' 2
+    return $! (fromIntegral (s `Buf.unsafeIndex` 0) `shiftl_w16` 8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1))
 
 -- | Read a Word16 in little endian format
 getWord16le :: Get Word16
 getWord16le = do
-    s <- getBytes 2
-    return $! (fromIntegral (s `B.unsafeIndex` 1) `shiftl_w16` 8) .|.
-              (fromIntegral (s `B.unsafeIndex` 0) )
+    s <- getBuffer' 2
+    return $! (fromIntegral (s `Buf.unsafeIndex` 1) `shiftl_w16` 8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 0) )
 
 -- | Read a Word32 in big endian format
 getWord32be :: Get Word32
 getWord32be = do
-    s <- getBytes 4
-    return $! (fromIntegral (s `B.unsafeIndex` 0) `shiftl_w32` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftl_w32` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftl_w32`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 3) )
+    s <- getBuffer' 4
+    return $! (fromIntegral (s `Buf.unsafeIndex` 0) `shiftl_w32` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftl_w32` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftl_w32`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 3) )
 
 -- | Read a Word32 in little endian format
 getWord32le :: Get Word32
 getWord32le = do
-    s <- getBytes 4
-    return $! (fromIntegral (s `B.unsafeIndex` 3) `shiftl_w32` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftl_w32` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftl_w32`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 0) )
+    s <- getBuffer' 4
+    return $! (fromIntegral (s `Buf.unsafeIndex` 3) `shiftl_w32` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftl_w32` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftl_w32`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 0) )
 
 -- | Read a Word64 in big endian format
 getWord64be :: Get Word64
 getWord64be = do
-    s <- getBytes 8
-    return $! (fromIntegral (s `B.unsafeIndex` 0) `shiftl_w64` 56) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftl_w64` 48) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftl_w64` 40) .|.
-              (fromIntegral (s `B.unsafeIndex` 3) `shiftl_w64` 32) .|.
-              (fromIntegral (s `B.unsafeIndex` 4) `shiftl_w64` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 5) `shiftl_w64` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 6) `shiftl_w64`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 7) )
+    s <- getBuffer' 8
+    return $! (fromIntegral (s `Buf.unsafeIndex` 0) `shiftl_w64` 56) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftl_w64` 48) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftl_w64` 40) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 3) `shiftl_w64` 32) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 4) `shiftl_w64` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 5) `shiftl_w64` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 6) `shiftl_w64`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 7) )
 
 -- | Read a Word64 in little endian format
 getWord64le :: Get Word64
 getWord64le = do
-    s <- getBytes 8
-    return $! (fromIntegral (s `B.unsafeIndex` 7) `shiftl_w64` 56) .|.
-              (fromIntegral (s `B.unsafeIndex` 6) `shiftl_w64` 48) .|.
-              (fromIntegral (s `B.unsafeIndex` 5) `shiftl_w64` 40) .|.
-              (fromIntegral (s `B.unsafeIndex` 4) `shiftl_w64` 32) .|.
-              (fromIntegral (s `B.unsafeIndex` 3) `shiftl_w64` 24) .|.
-              (fromIntegral (s `B.unsafeIndex` 2) `shiftl_w64` 16) .|.
-              (fromIntegral (s `B.unsafeIndex` 1) `shiftl_w64`  8) .|.
-              (fromIntegral (s `B.unsafeIndex` 0) )
+    s <- getBuffer' 8
+    return $! (fromIntegral (s `Buf.unsafeIndex` 7) `shiftl_w64` 56) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 6) `shiftl_w64` 48) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 5) `shiftl_w64` 40) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 4) `shiftl_w64` 32) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 3) `shiftl_w64` 24) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 2) `shiftl_w64` 16) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 1) `shiftl_w64`  8) .|.
+              (fromIntegral (s `Buf.unsafeIndex` 0) )
 
 {-# INLINE getWord8    #-}
 {-# INLINE getWord16be #-}

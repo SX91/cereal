@@ -24,5 +24,6 @@ executable cereal-bench
                      , array      >= 0.3
                      , bytestring >= 0.9
                      , criterion
+                     , semigroups
                      , binary     >= 0.5
                      , fail
